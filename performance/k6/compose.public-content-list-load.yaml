@@ -1,0 +1,92 @@
+name: regional-event-public-content-list-load
+
+services:
+  mysql:
+    image: mysql:8.0.42
+    command:
+      - --performance-schema=ON
+      - --log-output=TABLE
+      - --slow-query-log=ON
+      - --long-query-time=0.1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PERF_MYSQL_ROOT_PASSWORD:?PERF_MYSQL_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${PERF_MYSQL_DATABASE:-regional_event_perf}
+      MYSQL_USER: ${PERF_MYSQL_USER:-perf}
+      MYSQL_PASSWORD: ${PERF_MYSQL_PASSWORD:?PERF_MYSQL_PASSWORD is required}
+      TZ: UTC
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=$${MYSQL_PASSWORD} mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    mem_limit: 1536m
+    cpus: 1.5
+    volumes:
+      - public-content-list-mysql:/var/lib/mysql
+
+  redis:
+    image: redis:7.2.16-alpine
+    command:
+      - redis-server
+      - --requirepass
+      - ${PERF_REDIS_PASSWORD:?PERF_REDIS_PASSWORD is required}
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - noeviction
+    environment:
+      REDIS_PASSWORD: ${PERF_REDIS_PASSWORD:?PERF_REDIS_PASSWORD is required}
+      TZ: UTC
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$${REDIS_PASSWORD} redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    mem_limit: 256m
+    cpus: 0.5
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${PERF_MYSQL_DATABASE:-regional_event_perf}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      SPRING_DATASOURCE_USERNAME: ${PERF_MYSQL_USER:-perf}
+      SPRING_DATASOURCE_PASSWORD: ${PERF_MYSQL_PASSWORD:?PERF_MYSQL_PASSWORD is required}
+      SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE: 10
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: 10
+      SECURITY_CORS_ALLOWED_ORIGINS: https://public-content-load.local
+      AUTH_REDIS_HOST: redis
+      AUTH_REDIS_PORT: 6379
+      AUTH_REDIS_PASSWORD: ${PERF_REDIS_PASSWORD:?PERF_REDIS_PASSWORD is required}
+      JWT_ACCESS_ACTIVE_KEY_ID: perf-access
+      JWT_ACCESS_ACTIVE_KEY: ${PERF_JWT_ACCESS_KEY:?PERF_JWT_ACCESS_KEY is required}
+      JWT_REFRESH_ACTIVE_KEY_ID: perf-refresh
+      JWT_REFRESH_ACTIVE_KEY: ${PERF_JWT_REFRESH_KEY:?PERF_JWT_REFRESH_KEY is required}
+      QR_ACTIVE_KEY_ID: perf-qr
+      QR_ACTIVE_KEY: ${PERF_QR_KEY:?PERF_QR_KEY is required}
+      QR_TOKEN_TTL: PT5M
+      PORTONE_FAKE_ENABLED: "true"
+      IMAGE_STORAGE_FAKE_ENABLED: "true"
+      IMAGE_STORAGE_FAKE_BASE_URL: http://images.invalid/public-content-list-load
+      AWS_REGION: ap-northeast-2
+      PUBLIC_CATALOG_CACHE_TTL: PT10M
+      PERFORMANCE_FIXTURE_ENABLED: "false"
+      JAVA_TOOL_OPTIONS: -Xms512m -Xmx512m -XX:+UseG1GC
+      TZ: UTC
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:${PERF_API_PORT:-18080}:8080
+    mem_limit: 1024m
+    cpus: 2.0
+    stop_grace_period: 30s
+
+volumes:
+  public-content-list-mysql:
