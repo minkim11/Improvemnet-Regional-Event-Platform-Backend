@@ -45,11 +45,37 @@ function Assert-Command {
     }
 }
 
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock] $Command,
+        [Parameter(Mandatory = $true)][string] $Description,
+        [switch] $AllowFailure
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $Command
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0 -and -not $AllowFailure) {
+        throw "$Description failed with exit code $exitCode.`n$($output -join [Environment]::NewLine)"
+    }
+    return @($output)
+}
+
 function New-RandomSecret {
     param([ValidateRange(32, 256)][int] $ByteCount = 48)
 
     $bytes = [byte[]]::new($ByteCount)
-    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $randomNumberGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $randomNumberGenerator.GetBytes($bytes)
+    } finally {
+        $randomNumberGenerator.Dispose()
+    }
     return [Convert]::ToBase64String($bytes)
 }
 
@@ -79,12 +105,10 @@ function Invoke-Compose {
         [switch] $AllowFailure
     )
 
-    $output = & docker compose --file $composeFile --project-name $composeProject @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0 -and -not $AllowFailure) {
-        throw "docker compose $($Arguments -join ' ') failed with exit code $exitCode.`n$($output -join [Environment]::NewLine)"
-    }
-    return @($output)
+    return Invoke-NativeCommand `
+        -Command { & docker compose --file $composeFile --project-name $composeProject @Arguments 2>&1 } `
+        -Description "docker compose $($Arguments -join ' ')" `
+        -AllowFailure:$AllowFailure
 }
 
 function Invoke-MySql {
@@ -98,24 +122,24 @@ function Invoke-MySql {
     } else {
         'MYSQL_PWD="$MYSQL_PASSWORD" mysql --batch --raw --skip-column-names -u"$MYSQL_USER" "$MYSQL_DATABASE"'
     }
-    $output = $Sql | & docker compose --file $composeFile --project-name $composeProject `
-        exec -T mysql sh -c $credential 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "MySQL command failed.`n$($output -join [Environment]::NewLine)"
-    }
-    return @($output)
+    return Invoke-NativeCommand `
+        -Command {
+            $Sql | & docker compose --file $composeFile --project-name $composeProject `
+                exec -T mysql sh -c $credential 2>&1
+        } `
+        -Description 'MySQL command'
 }
 
 function Invoke-Redis {
     param([Parameter(Mandatory = $true)][string] $Command)
 
     $shellCommand = 'export REDISCLI_AUTH="$REDIS_PASSWORD"; ' + $Command
-    $output = & docker compose --file $composeFile --project-name $composeProject `
-        exec -T redis sh -c $shellCommand 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Redis command failed.`n$($output -join [Environment]::NewLine)"
-    }
-    return @($output)
+    return Invoke-NativeCommand `
+        -Command {
+            & docker compose --file $composeFile --project-name $composeProject `
+                exec -T redis sh -c $shellCommand 2>&1
+        } `
+        -Description 'Redis command'
 }
 
 function Wait-ForApi {
@@ -219,12 +243,20 @@ function Invoke-K6 {
             }
             $arguments += $Script
         }
-        if ($LogPath) {
-            & $K6Command @arguments 2>&1 | Tee-Object -FilePath $LogPath
-        } else {
-            & $K6Command @arguments
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            if ($LogPath) {
+                & $K6Command @arguments 2>&1 |
+                    ForEach-Object { $_.ToString() } |
+                    Tee-Object -FilePath $LogPath
+            } else {
+                & $K6Command @arguments
+            }
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
         }
-        $exitCode = $LASTEXITCODE
         if ($exitCode -ne 0) {
             throw "k6 failed with exit code ${exitCode}: $Script"
         }
@@ -421,9 +453,15 @@ function Save-EnvironmentEvidence {
         mysqlImage = 'mysql:8.0.42'
         redisImage = 'redis:7.2.16-alpine'
         resourceLimits = @{ api = '2 CPU / 1024 MiB'; mysql = '1.5 CPU / 1536 MiB'; redis = '0.5 CPU / 256 MiB' }
-        dockerVersion = ((& docker version --format '{{json .}}' 2>&1) -join [Environment]::NewLine)
-        dockerComposeVersion = ((& docker compose version 2>&1) -join [Environment]::NewLine)
-        k6Version = ((& $K6Command version 2>&1) -join [Environment]::NewLine)
+        dockerVersion = ((Invoke-NativeCommand `
+            -Command { & docker version --format '{{json .}}' 2>&1 } `
+            -Description 'docker version') -join [Environment]::NewLine)
+        dockerComposeVersion = ((Invoke-NativeCommand `
+            -Command { & docker compose version 2>&1 } `
+            -Description 'docker compose version') -join [Environment]::NewLine)
+        k6Version = ((Invoke-NativeCommand `
+            -Command { & $K6Command version 2>&1 } `
+            -Description 'k6 version') -join [Environment]::NewLine)
     }
     $evidence | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $Directory 'environment.json')
     Invoke-Compose -Arguments @('images') | Set-Content -Encoding UTF8 (Join-Path $Directory 'compose-images.txt')
