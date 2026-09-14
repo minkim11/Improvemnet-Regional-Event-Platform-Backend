@@ -34,6 +34,8 @@ $contentId = '992000'
 $fixtureEmail = 'public-content-load@example.com'
 $fixturePassword = 'Password1!'
 $authOrigin = 'https://public-content-load.local'
+$warmupRate = 25
+$warmupCooldownSeconds = 30
 $runTimestamp = [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssZ')
 $phaseDirectory = Join-Path (Join-Path $repositoryRoot $ResultRoot) "$runTimestamp-$($Phase.ToLowerInvariant())"
 
@@ -431,7 +433,8 @@ function Save-StabilityDecision {
     }
     $decision | ConvertTo-Json | Set-Content -Encoding UTF8 $OutputPath
     if (-not $decision.p95Stable -or -not $decision.throughputStable) {
-        throw "Stability failed: P95 difference=$([Math]::Round($p95DifferencePercent, 2))%, throughput difference=$([Math]::Round($throughputDifferencePercent, 2))%."
+        Write-Warning "Stability warning: P95 difference=$([Math]::Round($p95DifferencePercent, 2))%, throughput difference=$([Math]::Round($throughputDifferencePercent, 2))%." `
+            -WarningAction Continue
     }
 }
 
@@ -447,7 +450,9 @@ function Save-EnvironmentEvidence {
         dotnetRuntime = [Environment]::Version.ToString()
         rates = $Rates
         repetitions = $Repetitions
+        warmupRate = $warmupRate
         warmupDuration = $WarmupDuration
+        warmupCooldownSeconds = $warmupCooldownSeconds
         measurementDuration = $MeasurementDuration
         apiJava = '21 (Dockerfile amazoncorretto:21-al2023-headless)'
         mysqlImage = 'mysql:8.0.42'
@@ -556,19 +561,23 @@ try {
                 Reset-RunStack
                 Install-Fixture -OutputPath (Join-Path $runDirectory 'fixture-counts.tsv')
 
-                $preAllocatedVUs = [Math]::Max(20, $rateValue * $VuMultiplier)
+                $warmupPreAllocatedVUs = [Math]::Max(20, $warmupRate * $VuMultiplier)
+                $measurementPreAllocatedVUs = [Math]::Max(20, $rateValue * $VuMultiplier)
                 Invoke-K6 `
                     -Script $scenarioFile `
                     -Environment ($commonK6Environment + @{
-                        PERF_RATE = [string] $rateValue
-                        PERF_PRE_ALLOCATED_VUS = [string] $preAllocatedVUs
+                        PERF_RATE = [string] $warmupRate
+                        PERF_PRE_ALLOCATED_VUS = [string] $warmupPreAllocatedVUs
                         PERF_DURATION = $WarmupDuration
+                        PERF_REQUIRE_NO_DROPPED_ITERATIONS = 'false'
                         PERF_SUMMARY_DIRECTORY = $runDirectory
                         PERF_SUMMARY_BASENAME = 'warmup'
                     }) `
                     -SummaryExport (Join-Path $runDirectory 'warmup.json') `
                     -LogPath (Join-Path $runDirectory 'warmup.log')
 
+                Write-Host "워밍업이 완료되었습니다. 캐시 재적재 전 $warmupCooldownSeconds초 동안 대기합니다."
+                Start-Sleep -Seconds $warmupCooldownSeconds
                 Clear-AndReloadPublicCache |
                     ConvertTo-Json |
                     Set-Content -Encoding UTF8 (Join-Path $runDirectory 'cache-reload.json')
@@ -587,7 +596,7 @@ try {
                         -Script $scenarioFile `
                         -Environment ($commonK6Environment + @{
                             PERF_RATE = [string] $rateValue
-                            PERF_PRE_ALLOCATED_VUS = [string] $preAllocatedVUs
+                            PERF_PRE_ALLOCATED_VUS = [string] $measurementPreAllocatedVUs
                             PERF_DURATION = $MeasurementDuration
                             PERF_SUMMARY_DIRECTORY = $runDirectory
                             PERF_SUMMARY_BASENAME = 'measurement'

@@ -12,6 +12,7 @@ const testTag = 'public_content_list_load';
 const rate = positiveIntegerEnv('PERF_RATE', 25);
 const preAllocatedVUs = positiveIntegerEnv('PERF_PRE_ALLOCATED_VUS', rate * 2);
 const duration = env('PERF_DURATION', '8m');
+const requireNoDroppedIterations = env('PERF_REQUIRE_NO_DROPPED_ITERATIONS', 'true') !== 'false';
 const apiBase = apiBaseUrl();
 const regionId = requiredEnv('PERF_REGION_ID');
 
@@ -42,7 +43,7 @@ export const options = {
   },
   thresholds: {
     checks: ['rate==1'],
-    dropped_iterations: ['count==0'],
+    ...(requireNoDroppedIterations ? { dropped_iterations: ['count==0'] } : {}),
     expected_outcome_rate: ['rate==1'],
     http_req_failed: ['rate==0'],
     public_content_contract_error_rate: ['rate==0'],
