@@ -10,9 +10,10 @@ import { markdownSummary } from '../lib/summary.js';
 const scenarioName = 'public_content_list_load';
 const testTag = 'public_content_list_load';
 const rate = positiveIntegerEnv('PERF_RATE', 25);
-const preAllocatedVUs = positiveIntegerEnv('PERF_PRE_ALLOCATED_VUS', rate * 2);
+const preAllocatedVUs = positiveIntegerEnv('PERF_PRE_ALLOCATED_VUS', rate * 10);
 const duration = env('PERF_DURATION', '8m');
-const requireNoDroppedIterations = env('PERF_REQUIRE_NO_DROPPED_ITERATIONS', 'true') !== 'false';
+const requireTargetRate = env('PERF_REQUIRE_TARGET_RATE', 'true') !== 'false';
+const minimumRequestRate = rate * 0.95;
 const apiBase = apiBaseUrl();
 const regionId = requiredEnv('PERF_REGION_ID');
 
@@ -43,7 +44,7 @@ export const options = {
   },
   thresholds: {
     checks: ['rate==1'],
-    ...(requireNoDroppedIterations ? { dropped_iterations: ['count==0'] } : {}),
+    ...(requireTargetRate ? { http_reqs: [`rate>=${minimumRequestRate}`] } : {}),
     expected_outcome_rate: ['rate==1'],
     http_req_failed: ['rate==0'],
     public_content_contract_error_rate: ['rate==0'],
@@ -55,7 +56,7 @@ export const options = {
 
 export function handleSummary(data) {
   return markdownSummary(data, {
-    title: 'k6 Public Content List Load Summary',
+    title: '공개 콘텐츠 목록 부하테스트 결과',
     scenario: 'public-content-list-load',
     testTag,
     baseUrl: env('PERF_BASE_URL', ''),
@@ -63,6 +64,8 @@ export function handleSummary(data) {
     vus: preAllocatedVUs,
     duration,
     mode: `${rate} RPS constant-arrival-rate`,
+    targetRate: requireTargetRate ? rate : undefined,
+    minimumRequestRate,
   });
 }
 

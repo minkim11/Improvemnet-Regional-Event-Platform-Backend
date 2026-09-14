@@ -5,11 +5,11 @@ param(
 
     [int[]] $Rates = @(25, 50, 100),
     [ValidateRange(1, 10)]
-    [int] $Repetitions = 3,
+    [int] $Repetitions = 1,
     [string] $WarmupDuration = '5m',
     [string] $MeasurementDuration = '8m',
     [ValidateRange(1, 10)]
-    [int] $VuMultiplier = 2,
+    [int] $VuMultiplier = 10,
     [string] $BaseUrl = 'http://127.0.0.1:18080',
     [string] $K6Command = 'k6',
     [string] $ResultRoot = 'performance/k6/results/public-content-list-load',
@@ -230,7 +230,8 @@ function Invoke-K6 {
         [Parameter(Mandatory = $true)][hashtable] $Environment,
         [string] $SummaryExport,
         [string] $LogPath,
-        [switch] $Inspect
+        [switch] $Inspect,
+        [switch] $AllowThresholdFailure
     )
 
     $previous = Set-ProcessEnvironment -Values $Environment
@@ -259,7 +260,9 @@ function Invoke-K6 {
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
-        if ($exitCode -ne 0) {
+        if ($exitCode -eq 99 -and $AllowThresholdFailure) {
+            Write-Warning "k6가 목표 처리량 또는 오류 기준을 충족하지 못했습니다. 다음 RPS 측정을 계속합니다."
+        } elseif ($exitCode -ne 0) {
             throw "k6 failed with exit code ${exitCode}: $Script"
         }
     } finally {
@@ -438,6 +441,130 @@ function Save-StabilityDecision {
     }
 }
 
+function Get-ActuatorMetricValues {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $MetricName
+    )
+
+    if (-not (Test-Path $Path)) {
+        return @()
+    }
+    return @(Get-Content -Encoding UTF8 $Path | ForEach-Object {
+        $record = $_ | ConvertFrom-Json
+        if ($record.metric -eq $MetricName -and $null -ne $record.data.measurements) {
+            $measurement = $record.data.measurements | Where-Object { $_.statistic -eq 'VALUE' } | Select-Object -First 1
+            if ($null -ne $measurement) {
+                [double] $measurement.value
+            }
+        }
+    })
+}
+
+function Get-BottleneckCandidates {
+    param([Parameter(Mandatory = $true)][string] $RunDirectory)
+
+    $actuatorPath = Join-Path $RunDirectory 'actuator.ndjson'
+    $cpuValues = @(Get-ActuatorMetricValues -Path $actuatorPath -MetricName 'process.cpu.usage')
+    $pendingValues = @(Get-ActuatorMetricValues -Path $actuatorPath -MetricName 'hikaricp.connections.pending')
+    $candidates = @()
+    if ($cpuValues.Count -gt 0 -and ($cpuValues | Measure-Object -Average).Average -ge 0.85) {
+        $candidates += 'API CPU'
+    }
+    if ($pendingValues.Count -gt 0 -and ($pendingValues | Measure-Object -Maximum).Maximum -gt 0) {
+        $candidates += 'Hikari 연결 풀'
+    }
+    if ($candidates.Count -eq 0) {
+        return '자동 감지 없음'
+    }
+    return $candidates -join ', '
+}
+
+function Get-ExplorationResult {
+    param(
+        [Parameter(Mandatory = $true)][string] $SummaryPath,
+        [Parameter(Mandatory = $true)][string] $RunDirectory,
+        [Parameter(Mandatory = $true)][int] $TargetRate,
+        [Parameter(Mandatory = $true)][int] $Repetition
+    )
+
+    $summary = Get-Content -Raw -Encoding UTF8 $SummaryPath | ConvertFrom-Json
+    $actualRate = Get-SummaryMetric -Summary $summary -MetricName 'http_reqs' -ValueName 'rate'
+    $httpErrorRate = Get-SummaryMetric -Summary $summary -MetricName 'http_req_failed' -ValueName 'value'
+    $contractErrorRate = Get-SummaryMetric -Summary $summary -MetricName 'public_content_contract_error_rate' -ValueName 'value'
+    $p95 = Get-SummaryMetric -Summary $summary -MetricName 'http_req_duration' -ValueName 'p(95)'
+    $droppedCount = Get-SummaryMetric -Summary $summary -MetricName 'dropped_iterations' -ValueName 'count'
+    return [pscustomobject]@{
+        targetRate = $TargetRate
+        repetition = $Repetition
+        actualRate = $actualRate
+        attainmentPercent = $actualRate / $TargetRate * 100
+        p95Ms = $p95
+        droppedCount = [long] $droppedCount
+        httpErrorPercent = $httpErrorRate * 100
+        contractErrorPercent = $contractErrorRate * 100
+        normal = $httpErrorRate -eq 0 -and $contractErrorRate -eq 0 -and $actualRate -ge ($TargetRate * 0.95)
+        candidates = Get-BottleneckCandidates -RunDirectory $RunDirectory
+    }
+}
+
+function Save-ExplorationSummary {
+    param(
+        [Parameter(Mandatory = $true)][object[]] $Results,
+        [Parameter(Mandatory = $true)][string] $OutputPath
+    )
+
+    $orderedResults = @($Results | Sort-Object targetRate, repetition)
+    $firstFailed = $orderedResults | Where-Object { -not $_.normal } | Select-Object -First 1
+    $highestNormal = $orderedResults | Where-Object { $_.normal } | Sort-Object targetRate -Descending | Select-Object -First 1
+    if ($null -eq $firstFailed) {
+        $limitRange = "$($orderedResults[-1].targetRate) RPS 초과 — 더 높은 RPS 측정 필요"
+    } else {
+        $previousNormal = $orderedResults |
+            Where-Object { $_.normal -and $_.targetRate -lt $firstFailed.targetRate } |
+            Sort-Object targetRate -Descending |
+            Select-Object -First 1
+        $limitRange = if ($null -eq $previousNormal) {
+            "$($firstFailed.targetRate) RPS 이하"
+        } else {
+            "$($previousNormal.targetRate)~$($firstFailed.targetRate) RPS 사이"
+        }
+    }
+    $verifiedRate = if ($null -eq $highestNormal) { '확인되지 않음' } else { "$($highestNormal.targetRate) RPS" }
+    $previousP95 = $null
+    $rows = foreach ($result in $orderedResults) {
+        $latencySpike = $null -ne $previousP95 -and $result.p95Ms -ge ($previousP95 * 2)
+        if ($result.normal) {
+            $status = '정상'
+            $previousP95 = $result.p95Ms
+        } elseif ($result.targetRate -eq $firstFailed.targetRate) {
+            $status = '한계'
+        } else {
+            $status = '과부하'
+        }
+        $latency = if ($latencySpike) { '급증' } else { '-' }
+        "| $($result.targetRate) | $([Math]::Round($result.actualRate, 2)) | $([Math]::Round($result.attainmentPercent, 2))% | $([Math]::Round($result.p95Ms, 2))ms | $($result.droppedCount) | $([Math]::Round($result.httpErrorPercent, 2))% | $([Math]::Round($result.contractErrorPercent, 2))% | $status | $latency | $($result.candidates) |"
+    }
+    @(
+        '# 공개 콘텐츠 목록 처리 한계 탐색 결과'
+        ''
+        '## 결론'
+        ''
+        "- 단계 판정: 목표 RPS의 95% 이상 처리하고 HTTP·계약 오류가 없으면 정상"
+        "- 검증된 최고 처리량: **$verifiedRate**"
+        "- 처리 한계 위치: **$limitRange**"
+        '- 캐시 효과: 같은 RPS로 After를 실행한 뒤 검증된 최고 처리량이 상승했는지 비교'
+        ''
+        '## 단계별 결과'
+        ''
+        '| 목표 RPS | 실제 RPS | 목표 달성률 | P95 | drop | HTTP 오류 | 계약 오류 | 판정 | P95 변화 | 병목 후보 |'
+        '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |'
+        $rows
+        ''
+        '병목 후보는 자동 확정값이 아닙니다. 해당 단계의 actuator.ndjson, docker-stats.ndjson, MySQL·Redis 전후 파일로 교차 확인합니다.'
+    ) | Set-Content -Encoding UTF8 $OutputPath
+}
+
 function Save-EnvironmentEvidence {
     param([Parameter(Mandatory = $true)][string] $Directory)
 
@@ -454,6 +581,8 @@ function Save-EnvironmentEvidence {
         warmupDuration = $WarmupDuration
         warmupCooldownSeconds = $warmupCooldownSeconds
         measurementDuration = $MeasurementDuration
+        vuMultiplier = $VuMultiplier
+        minimumTargetAttainmentPercent = 95
         apiJava = '21 (Dockerfile amazoncorretto:21-al2023-headless)'
         mysqlImage = 'mysql:8.0.42'
         redisImage = 'redis:7.2.16-alpine'
@@ -501,6 +630,7 @@ $runtimeEnvironment = @{
 }
 $previousRuntimeEnvironment = Set-ProcessEnvironment -Values $runtimeEnvironment
 $stackStarted = $false
+$explorationResults = @()
 
 try {
     New-Item -ItemType Directory -Force -Path $phaseDirectory | Out-Null
@@ -569,7 +699,7 @@ try {
                         PERF_RATE = [string] $warmupRate
                         PERF_PRE_ALLOCATED_VUS = [string] $warmupPreAllocatedVUs
                         PERF_DURATION = $WarmupDuration
-                        PERF_REQUIRE_NO_DROPPED_ITERATIONS = 'false'
+                        PERF_REQUIRE_TARGET_RATE = 'false'
                         PERF_SUMMARY_DIRECTORY = $runDirectory
                         PERF_SUMMARY_BASENAME = 'warmup'
                     }) `
@@ -602,7 +732,8 @@ try {
                             PERF_SUMMARY_BASENAME = 'measurement'
                         }) `
                         -SummaryExport $summaryPath `
-                        -LogPath (Join-Path $runDirectory 'measurement.log')
+                        -LogPath (Join-Path $runDirectory 'measurement.log') `
+                        -AllowThresholdFailure
                 } finally {
                     Wait-Job -Job $collector -Timeout 30 | Out-Null
                     if ($collector.State -eq 'Running') {
@@ -621,8 +752,17 @@ try {
                     -SummaryPath $summaryPath `
                     -DurationSeconds $measurementSeconds `
                     -OutputPath (Join-Path $runDirectory 'stability.json')
+                $explorationResults += Get-ExplorationResult `
+                    -SummaryPath $summaryPath `
+                    -RunDirectory $runDirectory `
+                    -TargetRate $rateValue `
+                    -Repetition $repetition
             }
         }
+        Save-ExplorationSummary `
+            -Results $explorationResults `
+            -OutputPath (Join-Path $phaseDirectory 'result-summary.md')
+        Write-Host "결과 요약: $(Join-Path $phaseDirectory 'result-summary.md')"
     }
 
     Write-Host "Public content list load test completed: $phaseDirectory"
