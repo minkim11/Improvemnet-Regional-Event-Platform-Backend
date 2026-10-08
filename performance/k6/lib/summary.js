@@ -23,9 +23,14 @@ function consoleSummary(data, metadata) {
   const failed = metricValues(data, 'http_req_failed');
   const duration = metricValues(data, 'http_req_duration');
   const thresholdStatus = allThresholdsPassed(data) ? 'PASS' : 'FAIL';
+  const loadResult = publicLoadResult(data, metadata);
   return [
     '',
     `${metadata.title || metadata.scenario || 'k6'} summary`,
+    ...(loadResult ? [
+      `판정: ${loadResult.verdict}`,
+      `부하: 목표 ${loadResult.targetRate} RPS / 실제 ${formatNumber(loadResult.actualRate)} RPS / 보내지 못한 요청 ${numberValue(loadResult.droppedCount)}개 (${formatRate(loadResult.droppedRate)})`,
+    ] : []),
     `thresholds: ${thresholdStatus}`,
     `checks: ${formatRate(checks.rate)} (${numberValue(checks.passes)} passed, ${numberValue(checks.fails)} failed)`,
     `http_req_failed: ${formatRate(failed.rate)}`,
@@ -41,6 +46,7 @@ function renderMarkdownSummary(data, metadata) {
   const requests = metricValues(data, 'http_reqs');
   const duration = metricValues(data, 'http_req_duration');
   const thresholdStatus = allThresholdsPassed(data) ? 'PASS' : 'FAIL';
+  const loadResult = publicLoadResult(data, metadata);
   const runRows = [
     ['Generated at', metadata.createdAt],
     ['Base URL', metadata.baseUrl || metadata.apiBase],
@@ -62,6 +68,26 @@ function renderMarkdownSummary(data, metadata) {
   return [
     `# ${metadata.title || metadata.scenario || 'k6 Summary'}`,
     '',
+    ...(loadResult ? [
+      '## 한눈에 보는 결과',
+      '',
+      '일반적인 결과 확인은 이 섹션만 보면 됩니다.',
+      '',
+      `- 판정: **${loadResult.verdict}**`,
+      `- 이유: ${loadResult.reason}`,
+      `- 의미: ${loadResult.explanation}`,
+      '',
+      '| 확인 항목 | 결과 |',
+      '| --- | ---: |',
+      `| 목표 요청률 | ${loadResult.targetRate} RPS |`,
+      `| 실제 요청률 | ${formatNumber(loadResult.actualRate)} RPS |`,
+      `| 시작한 요청 | ${numberValue(loadResult.requestCount)}개 |`,
+      `| 보내지 못한 요청 | ${numberValue(loadResult.droppedCount)}개 (${formatRate(loadResult.droppedRate)}) |`,
+      `| HTTP 오류율 | ${formatRate(loadResult.failedRate)} |`,
+      `| 요청 검사 통과율 | ${formatRate(loadResult.checkRate)} |`,
+      `| 요청 95% 응답시간 | ${formatDuration(loadResult.p95)} |`,
+      '',
+    ] : []),
     '## Run',
     '',
     ...runRows.map(([label, value]) => `- ${label}: ${value}`),
@@ -93,6 +119,43 @@ function renderMarkdownSummary(data, metadata) {
     endpointExpectedOutcomeTable(data),
     '',
   ].join('\n');
+}
+
+function publicLoadResult(data, metadata) {
+  if (!Number.isFinite(metadata.targetRate)) {
+    return null;
+  }
+  const checks = metricValues(data, 'checks');
+  const failed = metricValues(data, 'http_req_failed');
+  const requests = metricValues(data, 'http_reqs');
+  const iterations = metricValues(data, 'iterations');
+  const dropped = metricValues(data, 'dropped_iterations');
+  const duration = metricValues(data, 'http_req_duration');
+  const scheduledCount = (iterations.count || 0) + (dropped.count || 0);
+  const droppedRate = scheduledCount > 0 ? (dropped.count || 0) / scheduledCount : 0;
+  const requestFailed = failed.rate > 0 || checks.rate < 1;
+  const minimumRequestRate = metadata.minimumRequestRate || metadata.targetRate * 0.95;
+  const targetMaintained = (requests.rate || 0) >= minimumRequestRate;
+
+  return {
+    targetRate: metadata.targetRate,
+    actualRate: requests.rate || 0,
+    requestCount: requests.count || 0,
+    droppedCount: dropped.count || 0,
+    droppedRate,
+    failedRate: failed.rate || 0,
+    checkRate: checks.rate || 0,
+    p95: duration['p(95)'],
+    verdict: requestFailed ? '실패 — HTTP 또는 계약 오류 발생'
+      : targetMaintained ? '정상 — 목표 처리량 달성'
+        : '한계 — 목표 처리량 미달',
+    reason: requestFailed ? '시작된 요청에서 HTTP 오류 또는 계약 위반이 발견됐습니다.'
+      : targetMaintained ? `실제 요청률이 목표의 95% 이상인 ${formatNumber(requests.rate)} RPS입니다.`
+        : `실제 요청률 ${formatNumber(requests.rate)} RPS가 최소 기준 ${formatNumber(minimumRequestRate)} RPS보다 낮습니다.`,
+    explanation: dropped.count > 0
+      ? '`dropped_iterations`는 HTTP 오류가 아니라, 모든 VU가 이전 응답을 기다려 k6가 새 요청을 시작하지 못한 횟수입니다.'
+      : 'k6가 부하 생성 누락 없이 요청을 시작했습니다.',
+  };
 }
 
 function thresholdTable(data) {
